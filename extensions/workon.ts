@@ -128,7 +128,7 @@ async function getYaml() {
 	try {
 		return await import("yaml");
 	} catch (error) {
-		throw new Error(`flow support requires yaml: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`flow support requires yaml: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 }
 
@@ -142,7 +142,7 @@ async function loadFlow(ctx: ExtensionContext, name: string): Promise<Step[]> {
 	try {
 		source = readFileSync(flowPath, "utf8");
 	} catch (error) {
-		throw new Error(`could not read flow ${name}: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`could not read flow ${name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 
 	const { parseDocument } = await getYaml();
@@ -150,7 +150,7 @@ async function loadFlow(ctx: ExtensionContext, name: string): Promise<Step[]> {
 	try {
 		document = parseDocument(source);
 	} catch (error) {
-		throw new Error(`could not parse flow ${name}: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`could not parse flow ${name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 	if (document.errors.length > 0)
 		throw new Error(`invalid flow ${name}: ${document.errors.map((error) => error.message).join("; ")}`);
@@ -159,7 +159,7 @@ async function loadFlow(ctx: ExtensionContext, name: string): Promise<Step[]> {
 	try {
 		config = document.toJS();
 	} catch (error) {
-		throw new Error(`could not read flow ${name}: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`could not read flow ${name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	}
 	if (!isRecord(config))
 		throw new Error(`flow ${name} must be a mapping with a steps key`);
@@ -185,7 +185,9 @@ async function saveFlow(ctx: ExtensionContext, name: string, workflow: Step[]): 
 		if (existsSync(tempPath)) {
 			try {
 				unlinkSync(tempPath);
-			} catch {}
+			} catch {
+				// Best-effort cleanup must not mask the save error.
+			}
 		}
 	}
 }
@@ -432,7 +434,7 @@ export default function flow(pi: ExtensionAPI) {
 	}
 
 	async function editFlow(ctx: ExtensionContext, name: string, initial: Step[]): Promise<void> {
-		let workflow = initial.map((step) => ({ ...step }));
+		const workflow = initial.map((step) => ({ ...step }));
 		while (true) {
 			const actions: PickerItem[] = [
 				{ value: "add", label: "Add step", description: "Choose command, model, and thinking level" },

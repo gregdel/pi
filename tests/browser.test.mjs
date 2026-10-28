@@ -386,7 +386,7 @@ test("interrupted shutdown closes warn and remain tracked until successful", asy
 test("snapshots, screenshot images, safe filenames, and full truncated output", async (t) => {
 	const large = "snapshot line\n".repeat(2100);
 	const png = Buffer.from("test png bytes");
-	const f = await fixture(t, async (_command, args, options) => {
+	const f = await fixture(t, async (_command, args) => {
 		const filename = args.find((arg) => arg.startsWith("--filename="))?.slice(11);
 		if (filename) await writeFile(filename, args.includes("screenshot") ? png : large);
 		if (args.includes("click")) {

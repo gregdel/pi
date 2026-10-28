@@ -106,14 +106,14 @@ export function loadProfile(name: string, ctx: ExtensionContext): AgentProfile {
 	try { source = readFileSync(path, "utf8"); }
 	catch (error) {
 		if (projectExists && !project && !existsSync(userPath) && !existsSync(packagePath)) {
-			throw new Error(`Project agent profile ${projectPath} requires saved project trust. Use /trust and restart Pi.`);
+			throw new Error(`Project agent profile ${projectPath} requires saved project trust. Use /trust and restart Pi.`, { cause: error });
 		}
-		throw new Error(`Could not read agent profile ${path}: ${errorText(error)}`);
+		throw new Error(`Could not read agent profile ${path}: ${errorText(error)}`, { cause: error });
 	}
 	let frontmatter: Record<string, unknown>;
 	let body: string;
 	try { ({ frontmatter, body } = parseFrontmatter<Record<string, unknown>>(source)); }
-	catch (error) { throw new Error(`Invalid agent profile ${path}: ${errorText(error)}`); }
+	catch (error) { throw new Error(`Invalid agent profile ${path}: ${errorText(error)}`, { cause: error }); }
 	const template = frontmatter?.template;
 	if (!frontmatter || typeof frontmatter !== "object" || Array.isArray(frontmatter) || frontmatter.name !== name ||
 		typeof frontmatter.description !== "string" || !frontmatter.description.trim() ||
@@ -1062,7 +1062,6 @@ export default function subagents(pi: ExtensionAPI): void {
 				const prompts = loader.getPrompts();
 				const prompt = profile ? expandProfileTask(profile, task, ctx.cwd, prompts.prompts, prompts.diagnostics) : task;
 
-				let child!: Child;
 				const ask = defineTool({
 					name: "ask_question",
 					label: "Ask Question",
@@ -1108,7 +1107,7 @@ export default function subagents(pi: ExtensionAPI): void {
 				session.setThinkingLevel(thinking);
 				if (session.thinkingLevel !== thinking) throw new Error(`Model does not support thinking level ${thinking}`);
 				if (!alive || signal?.aborted) throw new Error("Delegation cancelled");
-				child = {
+				const child: Child = {
 					name, profile: profile?.name, task, model: `${provider}/${modelId}`, thinking,
 					session, status: "running", createdAt: Date.now(), runNumber: 0, publishedRun: 0,
 					view: createAgentViewState(session.settingsManager.getHideThinkingBlock()),
