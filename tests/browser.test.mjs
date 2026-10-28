@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -79,13 +79,14 @@ test("generic HTTP(S) navigation and validation before execution", async (t) => 
 		await assert.rejects(f.execute({ action: "open", url }));
 	}
 	assert.equal(f.calls.length, 0);
-	await f.execute({ action: "open", url: "http://localhost:5173", headed: true });
-	assert.deepEqual(cliArgs(f.calls.at(-1)), ["open", "http://localhost:5173/", "--headed"]);
+	const opened = await f.execute({ action: "open", url: "http://localhost:5173", headed: true });
+	const config = `--config=${join(f.ctx.cwd, ".playwright-cli", opened.details.session, "browser.config.json")}`;
+	assert.deepEqual(cliArgs(f.calls.at(-1)), ["open", "http://localhost:5173/", "--headed", config]);
 	await f.execute({ action: "goto", url: "https://example.org/login" });
 	assert.deepEqual(cliArgs(f.calls.at(-1)), ["goto", "https://example.org/login"]);
 	process.env.PI_BROWSER_URL = "http://localhost:8080";
 	await f.execute({ action: "open" });
-	assert.deepEqual(cliArgs(f.calls.at(-1)), ["open", "http://localhost:8080/"]);
+	assert.deepEqual(cliArgs(f.calls.at(-1)), ["open", "http://localhost:8080/", config]);
 });
 
 test("action arguments preserve text without shell interpolation", async (t) => {
@@ -169,6 +170,147 @@ test("isolates sessions and only cleans up browsers used by this runtime", async
 	assert.equal(f.calls.length, closedCount);
 });
 
+test("open enforces isolated configuration without changing executable or sandbox settings", async (t) => {
+	const f = await fixture(t);
+	const inherited = {
+		PLAYWRIGHT_MCP_CDP_ENDPOINT: "http://localhost:9222",
+		PLAYWRIGHT_MCP_USER_DATA_DIR: "/personal/profile",
+		PLAYWRIGHT_MCP_STORAGE_STATE: "/personal/cookies.json",
+		PLAYWRIGHT_MCP_EXTENSION: "true",
+		PLAYWRIGHT_MCP_ISOLATED: "false",
+		PLAYWRIGHT_MCP_OUTPUT_DIR: "/shared/output",
+		PLAYWRIGHT_MCP_EXECUTABLE_PATH: "/custom/chromium",
+		PLAYWRIGHT_MCP_SANDBOX: "true",
+	};
+	for (const [key, value] of Object.entries(inherited)) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	await mkdir(join(f.ctx.cwd, ".playwright"));
+	await writeFile(join(f.ctx.cwd, ".playwright/cli.config.json"), JSON.stringify({ extension: true }));
+	const result = await f.execute({ action: "open", url: "http://localhost:3000" });
+	const call = f.calls.at(-1);
+	const path = call.args.find((arg) => arg.startsWith("--config="))?.slice(9);
+	const outputDir = join(f.ctx.cwd, ".playwright-cli", result.details.session);
+	assert.equal(path, join(outputDir, "browser.config.json"));
+	assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+		browser: {
+			isolated: true, cdpEndpoint: "", remoteEndpoint: "", userDataDir: "",
+			contextOptions: { storageState: { cookies: [], origins: [] } },
+		},
+		extension: false, outputDir,
+	});
+	for (const assignment of [
+		"PLAYWRIGHT_MCP_CDP_ENDPOINT=", "PLAYWRIGHT_MCP_USER_DATA_DIR=", "PLAYWRIGHT_MCP_STORAGE_STATE=",
+		"PLAYWRIGHT_MCP_EXTENSION=false", "PLAYWRIGHT_MCP_ISOLATED=true",
+		`PLAYWRIGHT_MCP_OUTPUT_DIR=${outputDir}`, "PLAYWRIGHT_MCP_EXECUTABLE_PATH=/custom/chromium",
+	]) assert.ok(call.args.includes(assignment), assignment);
+	assert.ok(!call.args.some((arg) => arg.startsWith("PLAYWRIGHT_MCP_SANDBOX=")));
+	assert.equal(process.env.PLAYWRIGHT_MCP_SANDBOX, "true");
+});
+
+for (const location of ["project", "environment"]) {
+	test(`isolated launch preserves safe ${location} settings and source-relative scripts`, async (t) => {
+		const f = await fixture(t);
+		const directory = join(f.ctx.cwd, location === "project" ? ".playwright" : "other");
+		await mkdir(directory);
+		const sourcePath = join(directory, "cli.config.json");
+		const previous = process.env.PLAYWRIGHT_MCP_CONFIG;
+		process.env.PLAYWRIGHT_MCP_CONFIG = location === "project" ? "does-not-exist.json" : sourcePath;
+		t.after(() => {
+			if (previous === undefined) delete process.env.PLAYWRIGHT_MCP_CONFIG;
+			else process.env.PLAYWRIGHT_MCP_CONFIG = previous;
+		});
+		await writeFile(sourcePath, JSON.stringify({
+			browser: {
+				launchOptions: { chromiumSandbox: true, slowMo: 50 },
+				contextOptions: { viewport: { width: 900, height: 700 }, locale: "en-GB", storageState: "personal.json" },
+				initPage: ["page.js"], initScript: ["scripts/init.js"],
+			},
+			network: { blockedOrigins: ["https://blocked.invalid"] }, timeouts: { action: 1234 },
+		}));
+		await f.execute({ action: "open", url: "http://localhost:3000" });
+		const path = f.calls.at(-1).args.find((arg) => arg.startsWith("--config="))?.slice(9);
+		const config = JSON.parse(await readFile(path, "utf8"));
+		assert.deepEqual(config.browser.launchOptions, { chromiumSandbox: true, slowMo: 50 });
+		assert.deepEqual(config.browser.contextOptions, {
+			viewport: { width: 900, height: 700 }, locale: "en-GB", storageState: { cookies: [], origins: [] },
+		});
+		assert.deepEqual(config.browser.initPage, [join(directory, "page.js")]);
+		assert.deepEqual(config.browser.initScript, [join(directory, "scripts/init.js")]);
+		assert.deepEqual(config.network, { blockedOrigins: ["https://blocked.invalid"] });
+		assert.deepEqual(config.timeouts, { action: 1234 });
+	});
+}
+
+test("unreadable or unsupported launch configuration fails before executing Playwright", async (t) => {
+	const f = await fixture(t);
+	const previous = process.env.PLAYWRIGHT_MCP_CONFIG;
+	process.env.PLAYWRIGHT_MCP_CONFIG = join(f.ctx.cwd, "missing.json");
+	t.after(() => {
+		if (previous === undefined) delete process.env.PLAYWRIGHT_MCP_CONFIG;
+		else process.env.PLAYWRIGHT_MCP_CONFIG = previous;
+	});
+	await assert.rejects(f.execute({ action: "open", url: "http://localhost:3000" }), /ENOENT/);
+	await writeFile(process.env.PLAYWRIGHT_MCP_CONFIG, "[browser]\nisolated=false");
+	await assert.rejects(f.execute({ action: "open", url: "http://localhost:3000" }), /requires a JSON Playwright config/);
+	assert.equal(f.calls.length, 0);
+});
+
+test("concurrent sessions cannot overwrite the same named screenshot", async (t) => {
+	let firstWritten;
+	const firstReady = new Promise((resolve) => { firstWritten = resolve; });
+	let releaseFirst;
+	const secondDone = new Promise((resolve) => { releaseFirst = resolve; });
+	let screenshots = 0;
+	const f = await fixture(t, async (_command, args) => {
+		const filename = args.find((arg) => arg.startsWith("--filename="))?.slice(11);
+		if (filename) {
+			const number = ++screenshots;
+			await writeFile(filename, `session ${number}`);
+			if (number === 1) { firstWritten(); await secondDone; }
+			else releaseFirst();
+		}
+		return { stdout: "ok", stderr: "", code: 0 };
+	});
+	const first = f.execute({ action: "screenshot", filename: "page" });
+	await firstReady;
+	const second = f.execute({ action: "screenshot", filename: "page" }, {
+		...f.ctx, sessionManager: { getSessionId: () => "another-session" },
+	});
+	const results = await Promise.all([first, second]);
+	assert.notEqual(results[0].details.artifactPath, results[1].details.artifactPath);
+	assert.deepEqual(results.map((result) => Buffer.from(result.content[1].data, "base64").toString()), ["session 1", "session 2"]);
+});
+
+test("linked snapshots cannot read another session or follow an escaping symlink", async (t) => {
+	let linkedPath;
+	const f = await fixture(t, async (_command, args) => {
+		const outputDir = args.find((arg) => arg.startsWith("PLAYWRIGHT_MCP_OUTPUT_DIR="))?.slice("PLAYWRIGHT_MCP_OUTPUT_DIR=".length);
+		if (!linkedPath) {
+			const secret = join(f.ctx.cwd, "private.txt");
+			await writeFile(secret, "private contents");
+			linkedPath = join(outputDir, "escape.yml");
+			await symlink(secret, linkedPath);
+		}
+		return { stdout: `[Snapshot](${linkedPath})`, stderr: "", code: 0 };
+	});
+	const escaped = await f.execute({ action: "click", target: "e1" });
+	assert.equal(escaped.details.snapshotPath, undefined);
+	assert.ok(!escaped.content[0].text.includes("private contents"));
+	await writeFile(join(dirname(linkedPath), "other.yml"), "another session's contents");
+	linkedPath = join(dirname(linkedPath), "other.yml");
+	const foreign = await f.execute({ action: "click", target: "e1" }, {
+		...f.ctx, sessionManager: { getSessionId: () => "another-session" },
+	});
+	assert.equal(foreign.details.snapshotPath, undefined);
+	assert.ok(!foreign.content[0].text.includes("another session's contents"));
+});
+
 test("failed launches remain eligible for cleanup", async (t) => {
 	const f = await fixture(t, async (_command, args) => ({
 		stdout: "", stderr: "launch failed", code: args.includes("open") ? 1 : 0,
@@ -248,8 +390,10 @@ test("snapshots, screenshot images, safe filenames, and full truncated output", 
 		const filename = args.find((arg) => arg.startsWith("--filename="))?.slice(11);
 		if (filename) await writeFile(filename, args.includes("screenshot") ? png : large);
 		if (args.includes("click")) {
-			await writeFile(join(options.cwd, ".playwright-cli/linked.yml"), "- button Hello");
-			return { stdout: "[Snapshot](.playwright-cli/linked.yml)", stderr: "", code: 0 };
+			const outputDir = args.find((arg) => arg.startsWith("PLAYWRIGHT_MCP_OUTPUT_DIR="))?.slice("PLAYWRIGHT_MCP_OUTPUT_DIR=".length);
+			const path = join(outputDir, "linked.yml");
+			await writeFile(path, "- button Hello");
+			return { stdout: `[Snapshot](${path})`, stderr: "", code: 0 };
 		}
 		return { stdout: "ok", stderr: "", code: 0 };
 	});
@@ -282,6 +426,8 @@ test("real Playwright/Chromium UI smoke test", { skip: process.env.PI_BROWSER_SM
 				<option value="">Reset</option><option value="--help">Literal help</option>
 			</select></label>
 			<output id="selected"></output>
+			<output id="cookies"></output>
+			<script>document.querySelector('#cookies').textContent = document.cookie</script>
 		`);
 	});
 	await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -290,19 +436,47 @@ test("real Playwright/Chromium UI smoke test", { skip: process.env.PI_BROWSER_SM
 		try {
 			return { ...await run(command, args, {
 				...options,
-				env: { ...process.env, XDG_CACHE_HOME: join(options.cwd, ".cache") },
+				env: {
+					...process.env,
+					HOME: join(options.cwd, ".home"),
+					XDG_CACHE_HOME: join(options.cwd, ".cache"),
+					PLAYWRIGHT_MCP_CDP_ENDPOINT: "http://127.0.0.1:1",
+					PLAYWRIGHT_MCP_USER_DATA_DIR: join(options.cwd, "personal-profile"),
+					PLAYWRIGHT_MCP_EXTENSION: "true",
+					PLAYWRIGHT_MCP_ISOLATED: "false",
+				},
 				maxBuffer: 8 * 1024 * 1024,
 			}), code: 0 };
 		} catch (error) {
 			return { stdout: error.stdout ?? "", stderr: error.stderr ?? "", code: error.code ?? 1 };
 		}
 	});
-	await f.execute({ action: "open", url: `http://127.0.0.1:${server.address().port}` });
+	const hostile = {
+		browser: {
+			cdpEndpoint: "http://127.0.0.1:1",
+			remoteEndpoint: "http://127.0.0.1:1",
+			userDataDir: join(f.ctx.cwd, "personal-profile"),
+			launchOptions: { chromiumSandbox: true },
+			contextOptions: { storageState: {
+				cookies: [{ name: "private-cookie", value: "secret", domain: "127.0.0.1", path: "/", expires: -1, httpOnly: false, secure: false, sameSite: "Lax" }],
+				origins: [],
+			} },
+		},
+		extension: true,
+	};
+	for (const directory of [join(f.ctx.cwd, ".playwright"), join(f.ctx.cwd, ".home/.playwright")]) {
+		await mkdir(directory, { recursive: true });
+		await writeFile(join(directory, "cli.config.json"), JSON.stringify(hostile));
+	}
+	const opened = await f.execute({ action: "open", url: `http://127.0.0.1:${server.address().port}` });
+	assert.equal(dirname(opened.details.snapshotPath), join(f.ctx.cwd, ".playwright-cli", opened.details.session));
+	assert.ok(!opened.content[0].text.includes("private-cookie"));
 	await f.execute({ action: "resize", width: 390, height: 844 });
 	await f.execute({ action: "fill", target: "#name", text: "Hello Pi" });
 	await f.execute({ action: "click", target: "button" });
 	const snapshot = await f.execute({ action: "snapshot" });
 	assert.match(snapshot.content[0].text, /Submitted: Hello Pi/);
+	assert.ok(!snapshot.content[0].text.includes("private-cookie"));
 	await f.execute({ action: "fill", target: "#name", text: "--help" });
 	assert.ok((await f.execute({ action: "snapshot" })).content[0].text.includes("--help"));
 	await f.execute({ action: "fill", target: "#name", text: "" });

@@ -4,3 +4,6 @@
 - Pi host modules belong in `peerDependencies` with `"*"` ranges, not runtime `dependencies`. Keep development versions pinned together; the test loader maps `pi-ai` to its `compat` entrypoint, matching Pi's extension loader.
 - Tests can use an existing Pi installation via `PI_PACKAGE_DIR=/path/to/@earendil-works/pi-coding-agent`. This supplies test modules, not the package's runtime dependencies.
 - The optional browser smoke test needs an existing Playwright CLI and browser. Do not install these or disable browser sandboxing to make a test pass.
+- Pi's `context` hook filters requests, not canonical compaction input. Compaction-hook errors fall back to host compaction; isolation-sensitive hooks must return `{ cancel: true }` on failure.
+- Pi can report idle while awaiting `agent_settled` handlers; the owning `prompt()` promise is the settlement barrier. Submitting during those handlers defers execution but resolves the new `prompt()` promise immediately.
+- Pi 1.4.0 also has a settlement race: input processing begun while streaming can finish during the previous run's `agent_settled` handlers and start an overlapping run, misattributing or suppressing subagent results. Treat this as an upstream limitation; retain steering rather than serializing all guidance as a workaround.

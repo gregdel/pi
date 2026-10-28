@@ -18,7 +18,7 @@ const jiti = createJiti(import.meta.url, {
 	].map((name) => [name, fileURLToPath(resolver.esmResolve(name === "@earendil-works/pi-ai" ? `${name}/compat` : name))])),
 });
 const { DefaultResourceLoader, ProjectTrustStore, SettingsManager } = await jiti.import("@earendil-works/pi-coding-agent");
-const { expandProfileTask, loadProfile } = await jiti.import(join(root, "extensions/subagents.ts"));
+const { childExtensionFactories, expandProfileTask, loadProfile } = await jiti.import(join(root, "extensions/subagents.ts"));
 
 async function fixture(t) {
 	const dir = await mkdtemp(join(here, ".package-test-"));
@@ -41,12 +41,13 @@ async function write(path, content) {
 	await writeFile(path, content);
 }
 
-function loader(f, packages = [root]) {
+function loader(f, packages = [root], options = {}) {
 	return new DefaultResourceLoader({
 		cwd: f.cwd, agentDir: f.agentDir,
 		settingsManager: SettingsManager.inMemory({ packages }),
 		noSkills: true, noThemes: true, noContextFiles: true,
 		disabledBuiltinExtensions: ["mcp", "llama.cpp", "codemode", "tool-search"],
+		...options,
 	});
 }
 
@@ -149,4 +150,89 @@ test("template precedence preserves personal overrides and project isolation", a
 	assert.equal(expandProfileTask({ ...planner, source: "project" }, "task", f.cwd, prompts), "Project task");
 	assert.throws(() => expandProfileTask(planner, "task", f.cwd, [project, unrelated]), /requires a prompt template/);
 	assert.throws(() => expandProfileTask(planner, "task", f.cwd, [{ ...bundled, content: "No argument placeholder" }]), /must contain \$ARGUMENTS/);
+});
+
+test("profile task expansion treats replacement metacharacters literally", async (t) => {
+	const f = await fixture(t);
+	const planner = loadProfile("planner", f.ctx);
+	const task = "quotes '\"\n$$ $& $` $' $1 $ARGUMENTS";
+	const templates = [prompt(join(root, "prompts/plan.md"), "before $ARGUMENTS between $ARGUMENTS after")];
+	assert.equal(expandProfileTask(planner, task, f.cwd, templates), `before ${task} between ${task} after`);
+});
+
+for (const trusted of [false, true]) {
+	test(`real Pi dedup preserves allowed fallback and user precedence (trusted=${trusted})`, async (t) => {
+		const f = await fixture(t);
+		const settings = SettingsManager.create(f.cwd, f.agentDir, { projectTrusted: trusted });
+		await write(join(f.agentDir, "settings.json"), JSON.stringify({ packages: [root] }));
+		const projectPath = join(f.cwd, ".pi/prompts/plan.md");
+		await write(projectPath, "Project $ARGUMENTS");
+		const resources = loader(f, [root], { settingsManager: settings });
+		await resources.reload();
+		const expand = (source = "package") => {
+			const { prompts, diagnostics } = resources.getPrompts();
+			return expandProfileTask({ ...loadProfile("planner", f.ctx), source }, "task", f.cwd, prompts, diagnostics);
+		};
+		const bundled = expand();
+		assert.notEqual(bundled, "Project task");
+		assert.ok(bundled.includes("task"));
+		assert.equal(expand("project"), trusted ? "Project task" : bundled);
+		if (trusted) assert.ok(resources.getPrompts().diagnostics.some((d) => d.collision?.loserPath === join(root, "prompts/plan.md")));
+
+		await write(join(f.agentDir, "prompts/plan.md"), "Personal $ARGUMENTS");
+		await resources.reload();
+		assert.equal(expand(), "Personal task");
+		assert.equal(expand("project"), trusted ? "Project task" : "Personal task");
+	});
+}
+
+for (const filter of [[], ["!prompts/plan.md"], ["-prompts/plan.md"]]) {
+	test(`dedup fallback never revives a package-disabled template ${JSON.stringify(filter)}`, async (t) => {
+		const f = await fixture(t);
+		await write(join(f.cwd, ".pi/prompts/plan.md"), "Project $ARGUMENTS");
+		const resources = loader(f, [{ source: root, prompts: filter }], {
+			settingsManager: SettingsManager.inMemory({ packages: [{ source: root, prompts: filter }] }, { projectTrusted: true }),
+		});
+		await resources.reload();
+		const { prompts, diagnostics } = resources.getPrompts();
+		assert.throws(() => expandProfileTask(loadProfile("planner", f.ctx), "task", f.cwd, prompts, diagnostics), /requires a prompt template/);
+	});
+}
+
+test("disabled personal prompts do not override enabled bundled fallback", async (t) => {
+	const f = await fixture(t);
+	await write(join(f.agentDir, "prompts/plan.md"), "Disabled $ARGUMENTS");
+	await write(join(f.agentDir, "settings.json"), JSON.stringify({ packages: [root], prompts: ["-prompts/plan.md"] }));
+	const resources = loader(f, [root], { settingsManager: SettingsManager.create(f.cwd, f.agentDir) });
+	await resources.reload();
+	const { prompts, diagnostics } = resources.getPrompts();
+	assert.doesNotMatch(expandProfileTask(loadProfile("planner", f.ctx), "task", f.cwd, prompts, diagnostics), /Disabled/);
+});
+
+test("child built-in factories follow parent registrations and Pi enablement/replacement rules", async (t) => {
+	const f = await fixture(t);
+	const parent = {
+		getAllTools: () => [{ name: "codemode" }, { name: "tool_search" }],
+		getCommands: () => [{ name: "mcp", source: "extension" }],
+	};
+	const factories = childExtensionFactories(parent);
+	assert.deepEqual(factories.map((item) => item.name), ["codemode", "tool-search", "mcp"]);
+	assert.ok(factories.every((item) => item.builtin && item.replaceable));
+	assert.deepEqual(childExtensionFactories({ getAllTools: () => [], getCommands: () => [] }), []);
+	const resources = loader(f, [], { extensionFactories: factories, disabledBuiltinExtensions: [] });
+	await resources.reload();
+	assert.deepEqual(resources.getExtensions().errors, []);
+	assert.deepEqual(resources.getExtensions().extensions.map((item) => item.path).sort(), ["builtin:codemode", "builtin:mcp", "builtin:tool-search"]);
+
+	await write(join(f.agentDir, "settings.json"), JSON.stringify({ extensions: ["-builtin:mcp", "-builtin:codemode"] }));
+	const disabled = loader(f, [], { extensionFactories: factories, disabledBuiltinExtensions: [], settingsManager: SettingsManager.create(f.cwd, f.agentDir) });
+	await disabled.reload();
+	assert.deepEqual(disabled.getExtensions().extensions.map((item) => item.path), ["builtin:tool-search"]);
+
+	await write(join(f.agentDir, "settings.json"), "{}");
+	await write(join(f.agentDir, "extensions/replacement.ts"), 'export default pi => { pi.registerCommand("mcp", { handler: async () => {} }); }');
+	const replacement = loader(f, [], { extensionFactories: factories, disabledBuiltinExtensions: [] });
+	await replacement.reload();
+	assert.deepEqual(replacement.getExtensions().errors, []);
+	assert.ok(!replacement.getExtensions().extensions.some((item) => item.path === "builtin:mcp"));
 });

@@ -292,6 +292,24 @@ test("inherited thinking is not silently clamped", async (t) => {
 	await rejected;
 });
 
+test("virtual caller models fail explicitly before displaying a picker", async (t) => {
+	const f = fixture(t);
+	f.ctx.model = { ...caller, api: "pi-virtual" };
+	await assert.rejects(f.select(), /Virtual model test\/caller is unsupported.*physical caller model/);
+	assert.equal(f.screens.length, 0);
+});
+
+test("virtual alternatives are excluded from selection, including under physical providers", async (t) => {
+	const f = fixture(t);
+	f.ctx.modelRegistry.getAvailable = () => [caller, { ...other, api: "pi-virtual" }];
+	const result = f.select();
+	assert.doesNotMatch(f.screens[0].text(), /test\/alternate/);
+	t.mock.timers.tick(30_000);
+	assert.deepEqual(await result, { model: caller, thinking: "high" });
+	f.ctx.modelRegistry.getAvailable = () => [{ ...other, api: "pi-virtual" }];
+	await assert.rejects(f.select(), /physical model is required.*virtual models are unsupported/);
+});
+
 test("no authenticated models fails before displaying a picker", async (t) => {
 	const f = fixture(t);
 	f.ctx.modelRegistry.getAvailable = () => [];

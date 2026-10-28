@@ -9,7 +9,10 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+	buildSessionProjection,
 	CONFIG_DIR_NAME,
+	generateSummaryWithUsage,
+	type CompactionResult,
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
@@ -45,7 +48,7 @@ function getCommandName(command: string): string | undefined {
 }
 
 function expandTask(command: string, task: string): string {
-	return command.replaceAll("$TASK", task);
+	return command.replaceAll("$TASK", () => task);
 }
 
 function getConfigDir(ctx: ExtensionContext): string {
@@ -247,7 +250,7 @@ async function pickFuzzy(
 
 	return ctx.ui.custom<string | undefined>((tui, theme, _keybindings, done) => {
 		const input = new Input();
-		let selectedIndex = Math.max(0, items.findIndex((item) => item.value === selectedValue));
+		let selectedIndex = Math.max(0, getFilteredItems().findIndex((item) => item.value === selectedValue));
 
 		function getFilteredItems(): PickerItem[] {
 			return filterPickerItems(items, input.getValue());
@@ -388,7 +391,10 @@ export default function flow(pi: ExtensionAPI) {
 		const commandName = await pickFuzzy(ctx, "Pick command", commands, getCommandName(existing?.command ?? ""));
 		if (!commandName) return undefined;
 
-		const command = await ctx.ui.editor("Step command", existing?.command ?? `/${commandName}`);
+		const command = await ctx.ui.editor(
+			"Step command",
+			existing?.command.replace(/^\s*\S+/, () => `/${commandName}`) ?? `/${commandName}`,
+		);
 		if (command === undefined) return undefined;
 
 		const models = ctx.scopedModels.length > 0
@@ -486,9 +492,6 @@ export default function flow(pi: ExtensionAPI) {
 
 		while (true) {
 			const flowNames = listFlowNames(ctx);
-			for (const name of flowNames)
-				await loadFlow(ctx, name);
-
 			const actions: PickerItem[] = [
 				{ value: "create", label: "Create flow", description: "Create a named flow" },
 				...flowNames.flatMap((name) => [
@@ -519,7 +522,11 @@ export default function flow(pi: ExtensionAPI) {
 			if (!name || !flowNames.includes(name)) continue;
 
 			if (operation === "edit") {
-				await editFlow(ctx, name, await loadFlow(ctx, name));
+				try {
+					await editFlow(ctx, name, await loadFlow(ctx, name));
+				} catch (error) {
+					ctx.ui.notify(`could not edit flow: ${error instanceof Error ? error.message : String(error)}`, "error");
+				}
 			} else if (operation === "rename") {
 				const nextName = (await ctx.ui.editor("Rename flow", name))?.trim();
 				if (!nextName || nextName === name) continue;
@@ -642,7 +649,7 @@ export default function flow(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event) => {
 		const marker = pendingMarker;
-		if (!active || !marker || marker.generation !== generation)
+		if (!active || !marker || marker.generation !== generation || event.messageType !== "user")
 			return;
 
 		pendingMarker = undefined;
@@ -659,11 +666,87 @@ export default function flow(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("context", (event) => {
+	function currentStep(details: unknown): boolean {
+		return isRecord(details) && details.generation === generation && details.step === stepIndex + 1;
+	}
+
+	pi.on("context", (event, ctx) => {
+		if (!active) return;
+		if (pendingMarker) return { messages: [] };
+
 		for (let index = event.messages.length - 1; index >= 0; index--) {
 			const message = event.messages[index];
-			if (message?.role === "custom" && message.customType === CONTEXT_MARKER)
+			if (message?.role === "custom" && message.customType === CONTEXT_MARKER && currentStep(message.details))
 				return { messages: event.messages.slice(index) };
+		}
+		// A scoped checkpoint replaces the marker once compaction cuts past it.
+		// Raw branch entries retain the marker even when model context does not.
+		const branch = ctx.sessionManager.getBranch();
+		const markerIndex = branch.findLastIndex((entry) => entry.type === "custom_message"
+			&& entry.customType === CONTEXT_MARKER && currentStep(entry.details));
+		const checkpoint = branch.findLast((entry) => entry.type === "compaction");
+		if (markerIndex >= 0 && checkpoint?.type === "compaction"
+			&& isRecord(checkpoint.details) && currentStep(checkpoint.details.flowStep)
+			&& branch.findIndex((entry) => entry.id === checkpoint.firstKeptEntryId) >= markerIndex) {
+			const index = event.messages.findIndex((message) => message.role === "compactionSummary" && message.summary === checkpoint.summary);
+			if (index >= 0) return { messages: event.messages.slice(index) };
+		}
+		// Never fall back to history from another step if the boundary is missing.
+		return { messages: [] };
+	});
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (!active) return;
+		// Pre-prompt compaction may run before the next step has its own marker.
+		const model = ctx.model;
+		if (pendingMarker || !model) return { cancel: true };
+		const markerIndex = event.branchEntries.findLastIndex((entry) => entry.type === "custom_message"
+			&& entry.customType === CONTEXT_MARKER && currentStep(entry.details));
+		if (markerIndex < 0) return { cancel: true };
+		const identity = { generation, step: stepIndex + 1 };
+		try {
+			event.signal.throwIfAborted();
+			// The host's cut point is safe for tool-call/result pairs, but its
+			// summary input includes earlier steps. Project only the active step.
+			const entries = event.branchEntries.slice(markerIndex);
+			const previous = entries.findLast((entry) => entry.type === "compaction");
+			if (previous && (!isRecord(previous.details) || !currentStep(previous.details.flowStep))) return { cancel: true };
+			const projected = buildSessionProjection(entries).entries;
+			const keepIndex = projected.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
+			const messages = projected.slice(0, Math.max(0, keepIndex)).flatMap((entry) => entry.messages)
+				.filter((message) => message.role !== "system");
+			const result: CompactionResult = {
+				summary: "",
+				firstKeptEntryId: keepIndex >= 0 ? event.preparation.firstKeptEntryId : entries[0]!.id,
+				tokensBefore: event.preparation.tokensBefore,
+			};
+			if (messages.length > 0) {
+				// The registry stream resolves auth, header overrides, and virtual routing.
+				const summary = await generateSummaryWithUsage(messages, model, undefined, undefined, undefined,
+					event.signal, event.customInstructions, undefined, ctx.thinkingLevel,
+					(model, context, options) => {
+						const stream = ctx.modelRegistry.streamSimple(model, context, options);
+						const response = stream.result.bind(stream);
+						stream.result = async () => {
+							const message = await response();
+							if (message.stopReason === "aborted") throw new Error("Summarization aborted");
+							return message;
+						};
+						return stream;
+					});
+				if (!summary.text.trim()) throw new Error("Summarization returned no text");
+				result.summary = summary.text;
+				result.usage = summary.usage;
+			}
+			if (event.signal.aborted || !active || !currentStep(identity)) return { cancel: true };
+			return { compaction: {
+				...result,
+				details: { flowStep: identity },
+			} };
+		} catch (error) {
+			if (!event.signal.aborted) ctx.ui.notify(`flow compaction failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			// Handler errors normally fall back to host compaction, which is unsafe here.
+			return { cancel: true };
 		}
 	});
 
@@ -672,13 +755,13 @@ export default function flow(pi: ExtensionAPI) {
 			lastStopReason = event.message.stopReason;
 	});
 
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("agent_settled", async (event, ctx) => {
 		if (!active)
 			return;
 
 		const runGeneration = generation;
-		if (!lastStopReason || ABNORMAL_STOP_REASONS.has(lastStopReason)) {
-			const reason = lastStopReason ?? "no assistant response";
+		if (event.aborted || !lastStopReason || ABNORMAL_STOP_REASONS.has(lastStopReason)) {
+			const reason = event.aborted ? "aborted" : lastStopReason ?? "no assistant response";
 			stop(ctx, `flow stopped after step ${stepIndex + 1}: ${reason}`);
 			return;
 		}

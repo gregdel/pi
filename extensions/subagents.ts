@@ -8,6 +8,9 @@ import {
 	CompactionSummaryMessageComponent,
 	CONFIG_DIR_NAME,
 	createAgentSession,
+	createCodemodeExtension,
+	createMcpExtension,
+	createToolSearchExtension,
 	CustomMessageComponent,
 	DefaultResourceLoader,
 	defineTool,
@@ -30,7 +33,9 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	type KeybindingsManager,
+	type InlineExtension,
 	type PromptTemplate,
+	type ResourceDiagnostic,
 	type SessionEntry,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -63,11 +68,12 @@ interface Child extends AgentViewModel {
 	name: AgentName;
 	thinking: ThinkingLevel;
 	pending?: PendingQuestion;
-	preflight?: Promise<void>;
+	preflight?: Promise<"queued" | "handled" | "started">;
 	runPromise?: Promise<void>;
 	createdAt: number;
 	runNumber: number;
 	publishedRun: number;
+	cancelRevision: number;
 	abortRequested: boolean;
 	destroyed: boolean;
 	unsubscribe: () => void;
@@ -117,17 +123,30 @@ export function loadProfile(name: string, ctx: ExtensionContext): AgentProfile {
 	return { name, template: typeof template === "string" ? template : undefined, instructions: body, source: origin };
 }
 
-export function expandProfileTask(profile: AgentProfile, task: string, cwd: string, prompts: PromptTemplate[]): string {
+export function expandProfileTask(
+	profile: AgentProfile, task: string, cwd: string, prompts: PromptTemplate[], diagnostics: ResourceDiagnostic[] = [],
+): string {
 	if (!profile.template) return task;
 	const globalPath = join(getAgentDir(), "prompts", `${profile.template}.md`);
 	const projectPath = join(cwd, CONFIG_DIR_NAME, "prompts", `${profile.template}.md`);
 	const packagePath = join(PACKAGE_ROOT, "prompts", `${profile.template}.md`);
 	const paths = profile.source === "project" ? [projectPath, globalPath, packagePath] : [globalPath, packagePath];
-	const template = paths.map((path) => prompts.find((item) => item.name === profile.template && item.filePath === path)).find(Boolean);
+	let template: Pick<PromptTemplate, "filePath" | "content"> | undefined;
+	for (const path of paths) {
+		template = prompts.find((item) => item.name === profile.template && item.filePath === path);
+		if (template) break;
+		// Only recover enabled templates Pi actually loaded, then dropped by name deduplication.
+		const collision = diagnostics.some((item) => item.collision?.resourceType === "prompt" &&
+			item.collision.name === profile.template && item.collision.loserPath === path);
+		if (collision) {
+			template = { filePath: path, content: parseFrontmatter(readFileSync(path, "utf8")).body };
+			break;
+		}
+	}
 	if (!template) throw new Error(`Agent ${profile.name} requires a prompt template at ${paths.join(" or ")}`);
 	if (!template.content.includes("$ARGUMENTS")) throw new Error(`Prompt template ${template.filePath} must contain $ARGUMENTS`);
 	// Expand only the template, preserving quotes and newlines in the task verbatim.
-	return template.content.replaceAll("$ARGUMENTS", task);
+	return template.content.replaceAll("$ARGUMENTS", () => task);
 }
 
 async function pick<T>(
@@ -214,14 +233,36 @@ async function pick<T>(
 	} finally { cleanup(); }
 }
 
+export function childExtensionFactories(pi: ExtensionAPI): InlineExtension[] {
+	const tools = pi.getAllTools();
+	const factories: InlineExtension[] = [];
+	for (const [name, tool, factory] of [
+		["codemode", "codemode", createCodemodeExtension],
+		["tool-search", "tool_search", createToolSearchExtension],
+	] as const) {
+		if (tools.some((item) => item.name === tool)) factories.push({ name, factory: factory(), builtin: true, replaceable: true });
+	}
+	// Do not resurrect MCP when the parent disabled it (including CLI --no-mcp).
+	if (pi.getCommands().some((item) => item.source === "extension" && item.name === "mcp")) {
+		factories.push({ name: "mcp", factory: createMcpExtension(), builtin: true, replaceable: true });
+	}
+	return factories;
+}
+
 export async function selectDelegationSettings(ctx: ExtensionContext, thinking: ThinkingLevel, signal?: AbortSignal) {
 	const currentProvider = ctx.model?.provider;
 	const currentModelId = ctx.model?.id;
 	const isCurrent = (model: NonNullable<ExtensionContext["model"]>) => model.provider === currentProvider && model.id === currentModelId;
-	const available = ctx.modelRegistry.getAvailable().sort((a, b) =>
+	const models = ctx.modelRegistry.getAvailable();
+	// The registry exposes virtual catalog entries, but not their router registrations.
+	const unsupported = (model: NonNullable<ExtensionContext["model"]>) => model.api === "pi-virtual";
+	if (ctx.model && unsupported(ctx.model)) {
+		throw new Error(`Virtual model ${currentProvider}/${currentModelId} is unsupported for delegation; select a physical caller model first`);
+	}
+	const available = models.filter((model) => !unsupported(model)).sort((a, b) =>
 		Number(isCurrent(b)) - Number(isCurrent(a)) || `${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
 	);
-	if (!available.length) throw new Error("No authenticated models available for delegation");
+	if (!available.length) throw new Error("No authenticated models available for delegation; a physical model is required (virtual models are unsupported)");
 	const inheritedLabel = currentProvider && currentModelId ? `${currentProvider}/${currentModelId}` : "caller model (unavailable)";
 	const picked = await pick(ctx, "model", available, (item) => `${item.provider}/${item.id}`, signal, {
 		timeoutLabel: `${inheritedLabel} / ${thinking}`, borderColor: MODEL_PICKER_BORDER,
@@ -840,52 +881,89 @@ export default function subagents(pi: ExtensionAPI): void {
 		changed(agent);
 	}
 
-	function startRun(agent: Child, text: string): void {
-		const runNumber = ++agent.runNumber;
-		agent.status = "running";
-		agent.abortRequested = false;
-		agent.view.diagnostic = undefined;
-		agent.view.activity = undefined;
-		changed(agent);
-		let preflightDone!: () => void;
-		agent.preflight = new Promise<void>((resolve) => { preflightDone = () => resolve(); });
-		const run = agent.session.prompt(text, { expandPromptTemplates: false, preflightResult: preflightDone });
+	function startRun(agent: Child, text: string): Promise<"queued" | "handled" | "started"> {
+		const begin = () => {
+			agent.status = "running";
+			agent.view.diagnostic = undefined;
+			agent.view.activity = undefined;
+			changed(agent);
+			return ++agent.runNumber;
+		};
+		const busy = agent.session.isStreaming;
+		let runNumber: number | undefined;
+		if (!busy) {
+			agent.abortRequested = false;
+			runNumber = begin();
+		}
+		let disposition: "queued" | "handled" | "started" | undefined;
+		let accept!: (value: "queued" | "handled" | "started") => void;
+		let reject!: (error: unknown) => void;
+		const preflight = new Promise<"queued" | "handled" | "started">((resolve, fail) => { accept = resolve; reject = fail; });
+		agent.preflight = preflight;
+		const run = agent.session.prompt(text, {
+			expandPromptTemplates: false, streamingBehavior: "steer",
+			preflightResult(result) {
+				disposition = result;
+				if (result === "started") {
+					runNumber ??= begin();
+					agent.runPromise = tracked;
+					// abort() may have run before input/auth finished and before Pi owned a run.
+					if (agent.abortRequested || agent.destroyed) void agent.session.abort();
+				}
+				accept(result);
+			},
+		});
 		const tracked = run.then(() => {
-			if (agent.runNumber === runNumber && agent.publishedRun < runNumber) finishRun(agent);
+			if (runNumber === undefined || agent.runNumber !== runNumber) return;
+			if (disposition === "handled") {
+				agent.status = "done";
+				publish(agent, "Message handled by child extension.");
+				changed(agent);
+			} else if (agent.publishedRun < runNumber) finishRun(agent);
 		}).catch((error: unknown) => {
-			if (agent.destroyed || agent.runNumber !== runNumber || agent.publishedRun >= runNumber) return;
+			reject(error);
+			if (runNumber === undefined || agent.destroyed || agent.runNumber !== runNumber || agent.publishedRun >= runNumber) return;
 			agent.status = agent.abortRequested ? "aborted" : "failed";
 			agent.view.diagnostic = agent.abortRequested ? "Child run aborted." : `Child run failed: ${errorText(error)}`;
 			publish(agent, agent.view.diagnostic);
 			changed(agent);
 		}).finally(() => {
-			preflightDone();
-			if (agent.runPromise === tracked) {
-				agent.runPromise = undefined;
-				agent.preflight = undefined;
-			}
+			if (agent.preflight === preflight) agent.preflight = undefined;
+			if (agent.runPromise === tracked) agent.runPromise = undefined;
 		});
-		agent.runPromise = tracked;
+		if (!busy) agent.runPromise = tracked;
+		return preflight;
 	}
 
 	async function send(agent: Child, text: string): Promise<"queued" | "handled" | "started"> {
-		if (agent.destroyed) throw new Error("Agent deleted");
-		if (agent.status === "waiting") throw new Error("Answer the pending question first");
-		if (agent.session.isStreaming || agent.status === "running") {
-			const result = await agent.session.steer(text);
-			changed(agent);
-			return result;
+		const revision = agent.cancelRevision;
+		for (;;) {
+			const preflight = agent.preflight;
+			await preflight;
+			if (agent.destroyed) throw new Error("Agent deleted");
+			if (!alive) throw new Error("Session shut down");
+			if (agent.cancelRevision !== revision) throw new Error("Message cancelled");
+			if (agent.status === "waiting") throw new Error("Answer the pending question first");
+			if (agent.preflight && agent.preflight !== preflight) continue;
+			// Pi clears isStreaming before awaiting settlement hooks. Its prompt()
+			// would resolve early and defer the submission while those hooks run.
+			const previousRun = agent.runPromise;
+			if (!agent.session.isStreaming && previousRun) {
+				await previousRun;
+				continue;
+			}
+			return startRun(agent, text);
 		}
-		startRun(agent, text);
-		return "started";
 	}
 
 	async function abort(agent: Child): Promise<void> {
-		if (agent.destroyed || (agent.status !== "running" && agent.status !== "waiting")) return;
+		if (agent.destroyed) return;
+		agent.cancelRevision++;
+		if (agent.status !== "running" && agent.status !== "waiting") return;
 		agent.abortRequested = true;
 		answerQuestion(agent, { answer: null, error: "Question aborted" });
-		await agent.preflight;
 		await agent.session.abort();
+		await agent.preflight?.catch(() => {});
 		await agent.runPromise;
 		if (agent.publishedRun < agent.runNumber) finishRun(agent);
 		changed(agent);
@@ -896,8 +974,8 @@ export default function subagents(pi: ExtensionAPI): void {
 		agent.destroyed = true;
 		answerQuestion(agent, { answer: null, error: "Agent deleted" });
 		try {
-			await agent.preflight;
 			await agent.session.abort();
+			await agent.preflight?.catch(() => {});
 			await agent.runPromise;
 			await agent.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		} finally {
@@ -977,10 +1055,12 @@ export default function subagents(pi: ExtensionAPI): void {
 				const settings = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: ctx.isProjectTrusted() });
 				const loader = new DefaultResourceLoader({
 					cwd: ctx.cwd, agentDir: getAgentDir(), settingsManager: settings,
+					extensionFactories: childExtensionFactories(pi),
 					appendSystemPromptOverride: profile?.instructions ? (base) => [...base, profile.instructions] : undefined,
 				});
 				await loader.reload();
-				const prompt = profile ? expandProfileTask(profile, task, ctx.cwd, loader.getPrompts().prompts) : task;
+				const prompts = loader.getPrompts();
+				const prompt = profile ? expandProfileTask(profile, task, ctx.cwd, prompts.prompts, prompts.diagnostics) : task;
 
 				let child!: Child;
 				const ask = defineTool({
@@ -1032,7 +1112,7 @@ export default function subagents(pi: ExtensionAPI): void {
 					name, profile: profile?.name, task, model: `${provider}/${modelId}`, thinking,
 					session, status: "running", createdAt: Date.now(), runNumber: 0, publishedRun: 0,
 					view: createAgentViewState(session.settingsManager.getHideThinkingBlock()),
-					abortRequested: false, destroyed: false, unsubscribe: () => {},
+					cancelRevision: 0, abortRequested: false, destroyed: false, unsubscribe: () => {},
 				};
 				child.unsubscribe = session.subscribe((event) => {
 					updateAgentView(child.view, event);
@@ -1041,7 +1121,7 @@ export default function subagents(pi: ExtensionAPI): void {
 				});
 				agents.set(name, child);
 				changed(child);
-				startRun(child, prompt);
+				void startRun(child, prompt).catch(() => {});
 				return { content: [{ type: "text", text: `Started ${name}${profile ? ` (${profile.name})` : ""}: ${child.model} / ${child.thinking}. Use /agent ${name} to view or answer questions.` }], details: { name, ...(profile ? { profile: profile.name } : {}) } };
 			} catch (error) {
 				try {

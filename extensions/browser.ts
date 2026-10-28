@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -132,32 +132,82 @@ function formatOutput(
 	return { text: truncation.content + notice, truncated: true };
 }
 
+function insideDirectory(root: string, path: string): boolean {
+	const child = relative(root, path);
+	return child !== "" && child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child);
+}
+
 async function linkedSnapshot(
 	stdout: string,
 	cwd: string,
+	outputDir: string,
 ): Promise<{ path: string; content: string } | undefined> {
 	const matches = [...stdout.matchAll(/\[Snapshot\]\(([^)]+)\)/g)];
 	const linkedPath = matches.at(-1)?.[1];
 	if (!linkedPath) return undefined;
 
-	const artifactRoot = resolve(cwd, ARTIFACT_DIR);
 	const path = resolve(cwd, linkedPath);
-	const pathFromRoot = relative(artifactRoot, path);
-	if (
-		pathFromRoot === "" ||
-		pathFromRoot.startsWith(`..${sep}`) ||
-		pathFromRoot === ".."
-	)
-		return undefined;
+	if (!insideDirectory(outputDir, path)) return undefined;
 
 	try {
-		return { path, content: await readFile(path, "utf8") };
+		const canonicalRoot = await realpath(outputDir);
+		const canonicalPath = await realpath(path);
+		if (!insideDirectory(canonicalRoot, canonicalPath)) return undefined;
+		return { path, content: await readFile(canonicalPath, "utf8") };
 	} catch {
 		return undefined;
 	}
 }
 
-function playwrightArgs(args: string[]): string[] {
+interface PlaywrightConfig {
+	browser?: {
+		initPage?: string[];
+		initScript?: string[];
+		contextOptions?: Record<string, unknown>;
+		[key: string]: unknown;
+	};
+	[key: string]: unknown;
+}
+
+async function isolatedConfig(cwd: string, outputDir: string): Promise<PlaywrightConfig> {
+	// Match CLI precedence: an existing project config wins over the environment.
+	const projectPath = join(cwd, ".playwright", "cli.config.json");
+	const sourcePath = existsSync(projectPath) ? projectPath
+		: process.env.PLAYWRIGHT_MCP_CONFIG ? resolve(cwd, process.env.PLAYWRIGHT_MCP_CONFIG) : undefined;
+	let config: PlaywrightConfig = {};
+	if (sourcePath) {
+		const source = await readFile(sourcePath, "utf8");
+		try {
+			config = JSON.parse(source.replace(/^\uFEFF/, ""));
+		} catch {
+			throw new Error(`Browser isolation requires a JSON Playwright config: ${sourcePath}`);
+		}
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error(`Playwright config must be an object: ${sourcePath}`);
+		}
+	}
+	const browser = config.browser ?? {};
+	return {
+		...config,
+		browser: {
+			...browser,
+			// Relocating the config must not change paths relative to its source.
+			...(browser.initPage ? { initPage: browser.initPage.map((path) => resolve(dirname(sourcePath!), path)) } : {}),
+			...(browser.initScript ? { initScript: browser.initScript.map((path) => resolve(dirname(sourcePath!), path)) } : {}),
+			// CLI configs merge with global settings; explicit empty values clear
+			// inherited attachment/profile settings instead of leaving them intact.
+			isolated: true,
+			cdpEndpoint: "",
+			remoteEndpoint: "",
+			userDataDir: "",
+			contextOptions: { ...browser.contextOptions, storageState: { cookies: [], origins: [] } },
+		},
+		extension: false,
+		outputDir,
+	};
+}
+
+function playwrightArgs(args: string[], outputDir: string): string[] {
 	// Use system Chromium when available; otherwise keep Playwright's defaults.
 	// Inherit sandbox settings rather than disabling Chromium's sandbox globally.
 	const executable =
@@ -165,6 +215,12 @@ function playwrightArgs(args: string[]): string[] {
 		(existsSync("/usr/bin/chromium") ? "/usr/bin/chromium" : undefined);
 	return [
 		...(executable ? [`PLAYWRIGHT_MCP_EXECUTABLE_PATH=${executable}`] : []),
+		"PLAYWRIGHT_MCP_CDP_ENDPOINT=",
+		"PLAYWRIGHT_MCP_USER_DATA_DIR=",
+		"PLAYWRIGHT_MCP_STORAGE_STATE=",
+		"PLAYWRIGHT_MCP_EXTENSION=false",
+		"PLAYWRIGHT_MCP_ISOLATED=true",
+		`PLAYWRIGHT_MCP_OUTPUT_DIR=${outputDir}`,
 		"playwright",
 		"cli",
 		...args,
@@ -340,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const typedParams = params as BrowserParams;
 			const session = sessionName(ctx);
-			const outputDir = join(ctx.cwd, ARTIFACT_DIR);
+			const outputDir = join(ctx.cwd, ARTIFACT_DIR, session);
 
 			let artifactPath: string | undefined;
 			if (typedParams.action === "snapshot") {
@@ -365,11 +421,14 @@ export default function (pi: ExtensionAPI) {
 				} satisfies BrowserDetails,
 			});
 
-			const args = playwrightArgs([
-				`-s=${session}`,
-				...commandArgs(typedParams, artifactPath),
-			]);
+			const command = commandArgs(typedParams, artifactPath);
 			await mkdir(outputDir, { recursive: true });
+			if (typedParams.action === "open") {
+				const configPath = join(outputDir, "browser.config.json");
+				await writeFile(configPath, JSON.stringify(await isolatedConfig(ctx.cwd, outputDir)), { mode: 0o600 });
+				command.push(`--config=${configPath}`);
+			}
+			const args = playwrightArgs([`-s=${session}`, ...command], outputDir);
 			// Track even failed opens so shutdown can clean up partial launches.
 			if (typedParams.action === "open") sessions.set(session, ctx.cwd);
 			const result = await pi.exec("env", args, {
@@ -421,7 +480,7 @@ export default function (pi: ExtensionAPI) {
 				fullOutputPath = artifactPath;
 				details.snapshotPath = artifactPath;
 			} else {
-				const snapshot = await linkedSnapshot(result.stdout, ctx.cwd);
+				const snapshot = await linkedSnapshot(result.stdout, ctx.cwd, outputDir);
 				if (snapshot) {
 					text += `\n\n### Current page snapshot\n${snapshot.content}`;
 					fullOutputPath = snapshot.path;
@@ -452,7 +511,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const result = await pi.exec(
 					"env",
-					playwrightArgs([`-s=${session}`, "close"]),
+					playwrightArgs([`-s=${session}`, "close"], join(cwd, ARTIFACT_DIR, session)),
 					{ cwd, timeout: 10_000 },
 				);
 				if (result.killed) {
