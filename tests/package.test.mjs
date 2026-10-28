@@ -55,30 +55,22 @@ const profile = (name, instructions = "User instructions") =>
 	`---\nname: ${name}\ndescription: Test profile\ntemplate: plan\n---\n${instructions}\n`;
 const prompt = (filePath, content) => ({ name: "plan", filePath, content });
 
-test("Pi loads all six package extensions and four prompts without dotfiles", async (t) => {
+async function customProfile(f) {
+	await write(join(f.agentDir, "agents/custom.md"), profile("custom"));
+	return loadProfile("custom", f.ctx);
+}
+
+test("Pi loads all five package extensions and four prompts without dotfiles", async (t) => {
 	const f = await fixture(t);
 	const resources = loader(f);
 	await resources.reload();
 	assert.deepEqual(resources.getExtensions().errors, []);
 	assert.deepEqual(resources.getExtensions().extensions.map((item) => item.path).sort(), [
-		"ask-question", "browser", "keep-model-on-new", "status-bar", "subagents", "workon",
+		"ask-question", "browser", "keep-model-on-new", "status-bar", "subagents",
 	].map((name) => join(root, "extensions", `${name}.ts`)).sort());
 	assert.deepEqual(resources.getPrompts().diagnostics, []);
 	assert.deepEqual(resources.getPrompts().prompts.map((item) => item.name).sort(), ["plan", "ponytail", "review", "update-memory"]);
-	const planner = loadProfile("planner", f.ctx);
-	assert.equal(planner.source, "package");
-	const task = 'Investigate "quoted input"\nKeep $1 and $ARGUMENTS literal';
-	assert.ok(expandProfileTask(planner, task, f.cwd, resources.getPrompts().prompts).includes(task));
-
-	// Exercise the deferred YAML import through Pi's real extension loader.
-	await write(join(f.cwd, ".pi/flow_test.yaml"), "steps: []\n");
-	const flow = resources.getExtensions().extensions.find((item) => item.path.endsWith("/workon.ts"));
-	const notices = [];
-	await flow.commands.get("flow").handler("test task", {
-		...f.ctx, isProjectTrusted: () => true, isIdle: () => true,
-		ui: { setStatus() {}, notify(message) { notices.push(message); } },
-	});
-	assert.deepEqual(notices, ["flow stopped: flow test: steps must be a non-empty list"]);
+	assert.throws(() => loadProfile("planner", f.ctx), /Could not read agent profile/);
 });
 
 test("the example narrows loading to questions, subagents, and the planning prompt", async (t) => {
@@ -102,62 +94,61 @@ test("Pi's prompt discovery preserves personal planning-template overrides", asy
 	await resources.reload();
 	assert.deepEqual(resources.getExtensions().errors, []);
 	assert.equal(resources.getPrompts().prompts.find((item) => item.name === "plan").filePath, path);
-	assert.equal(expandProfileTask(loadProfile("planner", f.ctx), "task", f.cwd, resources.getPrompts().prompts), "Personal task");
+	assert.equal(expandProfileTask(await customProfile(f), "task", f.cwd, resources.getPrompts().prompts), "Personal task");
 });
 
-test("personal profiles override bundled defaults, including malformed profiles", async (t) => {
+test("personal profiles load and malformed profiles fail explicitly", async (t) => {
 	const f = await fixture(t);
-	const path = join(f.agentDir, "agents/planner.md");
-	await write(path, profile("planner"));
-	assert.equal(loadProfile("planner", f.ctx).source, "user");
-	assert.match(loadProfile("planner", f.ctx).instructions, /User instructions/);
-	await write(path, "not a profile");
-	assert.throws(() => loadProfile("planner", f.ctx), /Invalid agent profile/);
+	const custom = await customProfile(f);
+	assert.equal(custom.source, "user");
+	assert.match(custom.instructions, /User instructions/);
+	await write(join(f.agentDir, "agents/custom.md"), "not a profile");
+	assert.throws(() => loadProfile("custom", f.ctx), /Invalid agent profile/);
 });
 
 test("project profiles require both current trust and a saved trust decision", async (t) => {
 	const f = await fixture(t);
-	await write(join(f.cwd, ".pi/agents/planner.md"), profile("planner", "Project instructions"));
-	assert.equal(loadProfile("planner", f.ctx).source, "package");
+	await customProfile(f);
+	await write(join(f.cwd, ".pi/agents/custom.md"), profile("custom", "Project instructions"));
+	assert.equal(loadProfile("custom", f.ctx).source, "user");
 	const trusted = { ...f.ctx, isProjectTrusted: () => true };
-	assert.equal(loadProfile("planner", trusted).source, "package");
+	assert.equal(loadProfile("custom", trusted).source, "user");
 	new ProjectTrustStore(f.agentDir).set(f.cwd, true);
-	assert.equal(loadProfile("planner", f.ctx).source, "package");
-	assert.equal(loadProfile("planner", trusted).source, "project");
-	assert.match(loadProfile("planner", trusted).instructions, /Project instructions/);
+	assert.equal(loadProfile("custom", f.ctx).source, "user");
+	assert.equal(loadProfile("custom", trusted).source, "project");
+	assert.match(loadProfile("custom", trusted).instructions, /Project instructions/);
 });
 
 test("unknown project-only profiles fail closed without saved trust", async (t) => {
 	const f = await fixture(t);
 	await write(join(f.cwd, ".pi/agents/custom.md"), profile("custom"));
 	assert.throws(() => loadProfile("custom", f.ctx), /requires saved project trust/);
-	for (const name of ["../planner", "/planner", "Planner", ""]) {
+	for (const name of ["../custom", "/custom", "Custom", ""]) {
 		assert.throws(() => loadProfile(name, f.ctx), /Agent profile name must match/);
 	}
 });
 
 test("template precedence preserves personal overrides and project isolation", async (t) => {
 	const f = await fixture(t);
-	const planner = loadProfile("planner", f.ctx);
+	const custom = await customProfile(f);
 	const bundled = prompt(join(root, "prompts/plan.md"), "Package $ARGUMENTS");
 	const user = prompt(join(f.agentDir, "prompts/plan.md"), "User $ARGUMENTS");
 	const project = prompt(join(f.cwd, ".pi/prompts/plan.md"), "Project $ARGUMENTS");
 	const unrelated = prompt(join(f.cwd, "other-package/plan.md"), "Other $ARGUMENTS");
 	const prompts = [unrelated, project, bundled, user];
-	assert.equal(expandProfileTask(planner, "task", f.cwd, prompts), "User task");
-	assert.equal(expandProfileTask(planner, "task", f.cwd, [unrelated, project, bundled]), "Package task");
-	assert.equal(expandProfileTask({ ...planner, source: "user" }, "task", f.cwd, prompts), "User task");
-	assert.equal(expandProfileTask({ ...planner, source: "project" }, "task", f.cwd, prompts), "Project task");
-	assert.throws(() => expandProfileTask(planner, "task", f.cwd, [project, unrelated]), /requires a prompt template/);
-	assert.throws(() => expandProfileTask(planner, "task", f.cwd, [{ ...bundled, content: "No argument placeholder" }]), /must contain \$ARGUMENTS/);
+	assert.equal(expandProfileTask(custom, "task", f.cwd, prompts), "User task");
+	assert.equal(expandProfileTask(custom, "task", f.cwd, [unrelated, project, bundled]), "Package task");
+	assert.equal(expandProfileTask({ ...custom, source: "project" }, "task", f.cwd, prompts), "Project task");
+	assert.throws(() => expandProfileTask(custom, "task", f.cwd, [project, unrelated]), /requires a prompt template/);
+	assert.throws(() => expandProfileTask(custom, "task", f.cwd, [{ ...bundled, content: "No argument placeholder" }]), /must contain \$ARGUMENTS/);
 });
 
 test("profile task expansion treats replacement metacharacters literally", async (t) => {
 	const f = await fixture(t);
-	const planner = loadProfile("planner", f.ctx);
+	const custom = await customProfile(f);
 	const task = "quotes '\"\n$$ $& $` $' $1 $ARGUMENTS";
 	const templates = [prompt(join(root, "prompts/plan.md"), "before $ARGUMENTS between $ARGUMENTS after")];
-	assert.equal(expandProfileTask(planner, task, f.cwd, templates), `before ${task} between ${task} after`);
+	assert.equal(expandProfileTask(custom, task, f.cwd, templates), `before ${task} between ${task} after`);
 });
 
 for (const trusted of [false, true]) {
@@ -169,9 +160,10 @@ for (const trusted of [false, true]) {
 		await write(projectPath, "Project $ARGUMENTS");
 		const resources = loader(f, [root], { settingsManager: settings });
 		await resources.reload();
-		const expand = (source = "package") => {
+		const custom = await customProfile(f);
+		const expand = (source = "user") => {
 			const { prompts, diagnostics } = resources.getPrompts();
-			return expandProfileTask({ ...loadProfile("planner", f.ctx), source }, "task", f.cwd, prompts, diagnostics);
+			return expandProfileTask({ ...custom, source }, "task", f.cwd, prompts, diagnostics);
 		};
 		const bundled = expand();
 		assert.notEqual(bundled, "Project task");
@@ -195,7 +187,8 @@ for (const filter of [[], ["!prompts/plan.md"], ["-prompts/plan.md"]]) {
 		});
 		await resources.reload();
 		const { prompts, diagnostics } = resources.getPrompts();
-		assert.throws(() => expandProfileTask(loadProfile("planner", f.ctx), "task", f.cwd, prompts, diagnostics), /requires a prompt template/);
+		const custom = await customProfile(f);
+		assert.throws(() => expandProfileTask(custom, "task", f.cwd, prompts, diagnostics), /requires a prompt template/);
 	});
 }
 
@@ -206,7 +199,7 @@ test("disabled personal prompts do not override enabled bundled fallback", async
 	const resources = loader(f, [root], { settingsManager: SettingsManager.create(f.cwd, f.agentDir) });
 	await resources.reload();
 	const { prompts, diagnostics } = resources.getPrompts();
-	assert.doesNotMatch(expandProfileTask(loadProfile("planner", f.ctx), "task", f.cwd, prompts, diagnostics), /Disabled/);
+	assert.doesNotMatch(expandProfileTask(await customProfile(f), "task", f.cwd, prompts, diagnostics), /Disabled/);
 });
 
 test("child built-in factories follow parent registrations and Pi enablement/replacement rules", async (t) => {

@@ -1007,11 +1007,11 @@ export default function subagents(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "delegate",
 		label: "Delegate",
-		description: "Start a concurrent in-process child agent. Set agent to planner to use a planning profile. Project profiles in .pi/agents require saved project trust and take precedence over user profiles. Profiles may specify a prompt template. A fuzzy TUI model picker defaults to the caller's model and thinking level after 30 untouched seconds. Any key disables that default; explicit model selection opens a manual thinking picker. Results appear in the parent when the child finishes; use /agent to talk to it.",
-		promptSnippet: "Start a concurrent child agent; set agent to planner for planning. An untouched model picker inherits the caller's model and thinking level after 30 seconds",
+		description: "Start a concurrent in-process child agent. Optionally select a user or trusted project agent profile. Project profiles in .pi/agents require saved project trust and take precedence over user profiles. Profiles may specify a prompt template. A fuzzy TUI model picker defaults to the caller's model and thinking level after 30 untouched seconds. Any key disables that default; explicit model selection opens a manual thinking picker. Results appear in the parent when the child finishes; use /agent to talk to it.",
+		promptSnippet: "Start a concurrent child agent with an optional custom profile. An untouched model picker inherits the caller's model and thinking level after 30 seconds",
 		parameters: Type.Object({
 			task: Type.String({ minLength: 1, description: "Task for the child agent" }),
-			agent: Type.Optional(Type.String({ description: "User or trusted project agent profile name, such as planner" })),
+			agent: Type.Optional(Type.String({ description: "User or trusted project agent profile name" })),
 		}),
 		async execute(_id, params, signal, _update, ctx) {
 			if (ctx.mode !== "tui") throw new Error("delegate requires an interactive Pi TUI in v1");

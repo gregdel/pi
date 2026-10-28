@@ -28,7 +28,7 @@ function fixture(t, { rows = 24, bindings = {} } = {}) {
 	const keys = new KeybindingsManager(bindings);
 	setKeybindings(keys);
 	const agents = [
-		{ name: "Joe", profile: "planner", status: "done", createdAt: 1, task: "Plan the change", model: "test/model", thinking: "high" },
+		{ name: "Joe", profile: "custom", status: "done", createdAt: 1, task: "Inspect the change", model: "test/model", thinking: "high" },
 		{ name: "Bob", status: "running", createdAt: 2, task: "Review the change", model: "test/model", thinking: "high" },
 	];
 	const listeners = new Set();
@@ -71,7 +71,7 @@ for (const action of ["open", "delete"]) {
 
 test("filtering includes profiles and handles empty results and removed selections", (t) => {
 	const f = fixture(t);
-	f.component.handleInput("planner");
+	f.component.handleInput("custom");
 	assert.match(f.selected(), /Joe/);
 	f.agents.splice(0, 1);
 	assert.match(f.text(), /No matches/);
