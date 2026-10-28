@@ -53,7 +53,7 @@ import {
 	result as questionResult,
 	type AskQuestionDetails,
 	type AskQuestionParams,
-} from "./ask-question";
+} from "./ask-question.ts";
 
 const NAMES = ["Joe", "Bob", "Sam", "Max", "Leo", "Ben", "Tom", "Dan", "Ray", "Jay"] as const;
 type AgentName = (typeof NAMES)[number];
