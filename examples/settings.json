@@ -1,0 +1,12 @@
+{
+  "packages": [
+    {
+      "source": "~/dev/pi",
+      "extensions": [
+        "extensions/ask-question.ts",
+        "extensions/subagents.ts"
+      ],
+      "prompts": ["prompts/plan.md"]
+    }
+  ]
+}

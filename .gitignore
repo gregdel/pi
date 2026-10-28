@@ -1,0 +1,4 @@
+node_modules/
+.playwright-cli/
+tests/.browser-test-*/
+tests/.package-test-*/
