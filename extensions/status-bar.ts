@@ -179,6 +179,77 @@ function buildUsage(ctx: ExtensionContext): string {
 	return muted(parts.join(" "));
 }
 
+interface CodexWindow {
+	used_percent: number;
+	reset_at: number;
+	limit_window_seconds: number;
+}
+
+// Same endpoint/window fields used by Codex and CodexBar:
+// https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/Providers/Codex/CodexOAuth/CodexOAuthUsageFetcher.swift
+function parseCodexWindows(data: unknown): CodexWindow[] {
+	const limits = (data as { rate_limit?: {
+		primary_window?: CodexWindow; secondary_window?: CodexWindow;
+	} } | null)?.rate_limit;
+	return [limits?.primary_window, limits?.secondary_window].filter((window): window is CodexWindow =>
+		!!window && Number.isFinite(window.used_percent) &&
+		Number.isFinite(window.reset_at) && window.reset_at > 0 &&
+		[18_000, 604_800].includes(window.limit_window_seconds));
+}
+
+function buildCodexLimits(windows: CodexWindow[] | undefined): string {
+	if (!windows?.length) return muted("Codex limits unavailable");
+	return [18_000, 604_800].flatMap((seconds) => {
+		const window = windows.find((entry) => entry.limit_window_seconds === seconds);
+		if (!window) return [];
+		const label = seconds === 18_000 ? "5h" : "1w";
+		const minutes = Math.ceil((window.reset_at * 1000 - Date.now()) / 60_000);
+		// A past reset does not imply a fresh allowance until the server confirms it.
+		if (minutes <= 0) return [muted(`${label} ?/resetting`)];
+		const reset = minutes >= 1440
+			? `${Math.floor(minutes / 1440)}d${Math.floor((minutes % 1440) / 60)}h`
+			: minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : `${minutes}m`;
+		const left = Math.round(100 - Math.max(0, Math.min(100, window.used_percent)));
+		const color = window.used_percent > 90 ? error : window.used_percent > 70 ? warning : muted;
+		return [color(`${label} ${left}%/${reset}`)];
+	}).join(" · ");
+}
+
+function watchCodexLimits(ctx: ExtensionContext, update: (windows: CodexWindow[] | undefined) => void): () => void {
+	const controller = new AbortController();
+	let refreshing = false;
+	const refresh = async () => {
+		if (refreshing || controller.signal.aborted) return;
+		refreshing = true;
+		try {
+			// Pi handles credential refresh; never read or write auth.json ourselves.
+			const token = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
+			if (controller.signal.aborted) return;
+			if (!token) throw new Error("No Codex login");
+			const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+			const accountId = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+			if (typeof accountId !== "string" || !accountId) throw new Error("No Codex account");
+			const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+				headers: { Authorization: `Bearer ${token}`, "ChatGPT-Account-Id": accountId, Accept: "application/json" },
+				signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
+				redirect: "error",
+			});
+			if (!response.ok) throw new Error(`Codex usage: ${response.status}`);
+			const windows = parseCodexWindows(await response.json());
+			if (!controller.signal.aborted) update(windows);
+		} catch {
+			// Do not retain stale percentages or surface credentials/server bodies.
+			if (!controller.signal.aborted) update(undefined);
+		} finally {
+			refreshing = false;
+		}
+	};
+	void refresh();
+	const timer = setInterval(() => { void refresh(); }, 60_000);
+	timer.unref();
+	return () => { controller.abort(); clearInterval(timer); };
+}
+
 function buildContext(ctx: ExtensionContext, autoCompactEnabled: boolean): string {
 	const usage = ctx.getContextUsage();
 	const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
@@ -268,8 +339,22 @@ function loadAutoCompactSetting(ctx: ExtensionContext): boolean {
 export default function footerExtension(pi: ExtensionAPI) {
 	let requestRender: (() => void) | undefined;
 	let autoCompactEnabled = true;
+	let codexWindows: CodexWindow[] | undefined;
+	let stopCodexLimits: (() => void) | undefined;
 
 	const redraw = () => requestRender?.();
+	const stopLimits = () => {
+		stopCodexLimits?.();
+		stopCodexLimits = undefined;
+		codexWindows = undefined;
+	};
+	const startLimits = (ctx: ExtensionContext) => {
+		stopLimits();
+		if (requestRender && ctx.mode === "tui" && ctx.model?.provider === "openai-codex" && ctx.modelRegistry.isUsingOAuth(ctx.model)) {
+			stopCodexLimits = watchCodexLimits(ctx, (windows) => { codexWindows = windows; redraw(); });
+		}
+		redraw();
+	};
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
@@ -282,6 +367,7 @@ export default function footerExtension(pi: ExtensionAPI) {
 
 			return {
 				dispose() {
+					stopLimits();
 					unsubscribeBranch();
 					requestRender = undefined;
 				},
@@ -301,6 +387,7 @@ export default function footerExtension(pi: ExtensionAPI) {
 					const usage = buildUsage(ctx);
 					if (visibleWidth(usage) > 0) telemetryParts.push(usage);
 					telemetryParts.push(buildContext(ctx, autoCompactEnabled));
+					if (stopCodexLimits) telemetryParts.push(buildCodexLimits(codexWindows));
 
 					if (process.env.PI_EXPERIMENTAL === "1") {
 						telemetryParts.push(warning("xp"));
@@ -333,11 +420,13 @@ export default function footerExtension(pi: ExtensionAPI) {
 				},
 			};
 		});
+		startLimits(ctx);
 	});
+	pi.on("session_shutdown", stopLimits);
 
 	// Values used by render() are live. Explicitly request redraws for state
 	// changes that may not otherwise invalidate a custom footer component.
-	pi.on("model_select", redraw);
+	pi.on("model_select", (_event, ctx) => startLimits(ctx));
 	pi.on("thinking_level_select", redraw);
 	pi.on("session_info_changed", redraw);
 	pi.on("message_end", redraw);
