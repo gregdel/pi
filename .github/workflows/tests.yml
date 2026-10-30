@@ -32,5 +32,11 @@ jobs:
         run: bun run lint
       - name: Type check
         run: bun run typecheck
-      - name: Run tests
+      - name: Run tests (256 colors)
         run: bun run test
+        env:
+          PI_TRUE_COLOR: "0"
+      - name: Run tests (truecolor)
+        run: bun run test
+        env:
+          PI_TRUE_COLOR: "1"

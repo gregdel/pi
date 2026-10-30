@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "pi-tools",
+      "dependencies": {
+        "diff": "8.0.4",
+      },
       "devDependencies": {
         "@earendil-works/pi-agent-core": "1.4.0",
         "@earendil-works/pi-ai": "1.4.0",

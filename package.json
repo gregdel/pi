@@ -14,6 +14,9 @@
     "extensions": ["./extensions/*.ts"],
     "prompts": ["./prompts/*.md"]
   },
+  "dependencies": {
+    "diff": "8.0.4"
+  },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",

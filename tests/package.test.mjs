@@ -60,13 +60,13 @@ async function customProfile(f) {
 	return loadProfile("custom", f.ctx);
 }
 
-test("Pi loads all five package extensions and four prompts without dotfiles", async (t) => {
+test("Pi loads all six package extensions and four prompts without dotfiles", async (t) => {
 	const f = await fixture(t);
 	const resources = loader(f);
 	await resources.reload();
 	assert.deepEqual(resources.getExtensions().errors, []);
 	assert.deepEqual(resources.getExtensions().extensions.map((item) => item.path).sort(), [
-		"ask-question", "browser", "keep-model-on-new", "status-bar", "subagents",
+		"ask-question", "browser", "keep-model-on-new", "pretty-diff", "status-bar", "subagents",
 	].map((name) => join(root, "extensions", `${name}.ts`)).sort());
 	assert.deepEqual(resources.getPrompts().diagnostics, []);
 	assert.deepEqual(resources.getPrompts().prompts.map((item) => item.name).sort(), ["plan", "ponytail", "review", "update-memory"]);
