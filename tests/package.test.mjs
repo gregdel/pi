@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,16 +60,16 @@ async function customProfile(f) {
 	return loadProfile("custom", f.ctx);
 }
 
-test("Pi loads all six package extensions and four prompts without dotfiles", async (t) => {
+test("Pi loads the package extensions and prompts without errors or dotfiles", async (t) => {
 	const f = await fixture(t);
 	const resources = loader(f);
 	await resources.reload();
+	const files = async (dir, ext) => (await readdir(join(root, dir)))
+		.filter((name) => name.endsWith(ext)).map((name) => join(root, dir, name)).sort();
 	assert.deepEqual(resources.getExtensions().errors, []);
-	assert.deepEqual(resources.getExtensions().extensions.map((item) => item.path).sort(), [
-		"ask-question", "browser", "keep-model-on-new", "pretty-diff", "status-bar", "subagents",
-	].map((name) => join(root, "extensions", `${name}.ts`)).sort());
+	assert.deepEqual(resources.getExtensions().extensions.map((item) => item.path).sort(), await files("extensions", ".ts"));
 	assert.deepEqual(resources.getPrompts().diagnostics, []);
-	assert.deepEqual(resources.getPrompts().prompts.map((item) => item.name).sort(), ["plan", "ponytail", "review", "update-memory"]);
+	assert.deepEqual(resources.getPrompts().prompts.map((item) => item.filePath).sort(), await files("prompts", ".md"));
 	assert.throws(() => loadProfile("planner", f.ctx), /Could not read agent profile/);
 });
 

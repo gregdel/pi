@@ -14,8 +14,9 @@ branch since the common ancestor). Ask if the target or direction is unclear.
 
 Without a request, review `git diff --cached`. If it is empty, ask me what to
 review instead: the last commit, the diff from master, or another commit or
-branch comparison. In an interactive TUI, use `ask_question`; otherwise ask in
-plain text. Wait for my answer rather than guessing.
+branch comparison. Use your structured question tool if one is available
+(such as `ask_question` in Pi or `AskUserQuestion` in Claude Code); otherwise
+ask in plain text. Wait for my answer rather than guessing.
 
 Review only the selected changes. Inspect relevant surrounding code and tests
 as needed, but do not include unrelated unstaged or untracked changes. When
